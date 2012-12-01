@@ -1,3 +1,4 @@
+
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 from pox.lib.revent.revent import *
@@ -5,12 +6,14 @@ from heapq import heappush, heappop
 import pox.lib.addresses as addresses
 from pox.lib.packet import *
 import time
+from pox.lib.recoco.recoco        import Timer
 
 log = core.getLogger("ee")
 
 import logging
 import logging.handlers
 fw_log = core.getLogger("fw")
+fw = None
 
 def addRemoteLogger(l, p):
   h = logging.handlers.DatagramHandler("127.0.0.1", p)
@@ -23,7 +26,7 @@ addRemoteLogger(fw_log, 9999)
 addRemoteLogger(logging.getLogger(), 9998)
 
 
-MAX_CONNECTIONS = 10000
+MAX_CONNECTIONS = 7000
 
 
 PRIORITY_NORMAL = 10 #of.OFP_DEFAULT_PRIORITY
@@ -33,17 +36,15 @@ PRIORITY_FLOOD_REST = PRIORITY_ALL_TCP - 1
 LOCAL_NETWORK = addresses.parseCIDR("10.1.1.0/24")
 INTERNAL_ADDRESS = addresses.IPAddr("10.1.1.1")
 
+MAX_BUFFERED_PACKETS = 15000
+MAX_BUFFERED_PER_CONNECTION = 500
+current_buffered_packets = 0
 
 UNKNOWN_PORT = object()
-
-#INSIDE_PORT = UNKNOWN_PORT
-#OUTSIDE_PORT = UNKNOWN_PORT
-#INTERNAL_PORT = UNKNOWN_PORT
 
 INSIDE_PORT = ["uap0","eth0"]
 OUTSIDE_PORT = "veth1"
 INTERNAL_PORT = "veth1"
-
 
 class ACTION_FORWARD: pass
 class ACTION_DROP: pass
@@ -196,11 +197,44 @@ class FlowSignature (object):
   def flipped (self):
     return FlowSignature(self.dst, self.dstport, self.src, self.srcport)
 
+COOKIE_MIN = 10000
+cookienum = COOKIE_MIN
+
+connections_with_strays = set()
+def roll_strays ():
+  global connections_with_strays
+  if len(connections_with_strays) == 0:
+    return
+  global current_buffered_packets
+  t = time.time() - 90
+  keep = set()
+  for s in connections_with_strays:
+    for w in [False, True]:
+      if s.stray_time[w] is None:
+        continue
+      if s.stray_time[w] < t:
+        if s.stray[w]:
+          current_buffered_packets -= len(s.stray[w])
+          s.stray[w] = None
+          log.warning(str(s) + " stray packets timed out")
+      else:
+        keep.add(s)
+  log.info("kept %i of %i strays (%i total)", len(keep), len(connections_with_strays), current_buffered_packets)
+  connections_with_strays = keep
+
 
 class Connection (object):
   def __init__ (self, sig, action, opaque = None):
+    global cookienum
+    self.cookie = cookienum
+    cookienum += 1
+
     self.sig = sig
     self.sig_r = sig.flipped
+
+    self.seq = [None, None]
+    self.stray = [None,None]
+    self.stray_time = [None, None]
 
     self.opaque = opaque
 
@@ -209,6 +243,34 @@ class Connection (object):
 
     self.action = action
 
+    self.fully_installed = False
+
+    self.packet = None # First packet
+
+  def send (self, packet, reverse = False):
+    if self.packet is None:
+      self.error("Connection.send() before prototype packet")
+      return
+    if type(packet) is ethernet:
+      eth = packet
+    else:
+      es = self.packet.src
+      ed = self.packet.dst
+      ips = self.packet.next.srcip
+      ipd = self.packet.next.dstip
+      rrr = self.packet.next.srcip == self.sig.dst
+      if reverse is not rrr:
+        es,ed = ed,es
+        ips,ipd = ipd,ips
+
+      eth = ethernet(src=es, dst=ed, type=self.packet.type,
+                     payload=ipv4(srcip=ips, dstip=ipd,
+                     protocol=ipv4.TCP_PROTOCOL, payload=packet))
+
+    core.gateway.switch.send(of.ofp_packet_out(
+         action = of.ofp_action_output(port = INSIDE_PORT if reverse else OUTSIDE_PORT),
+         data = eth.pack()))
+
   def __eq__ (self, other):
     if isinstance(other, Connection):
       return self.sig == other.sig
@@ -216,7 +278,7 @@ class Connection (object):
     return self.sig == other
 
   def __str__ (self):
-    return "<Connection %s>" % (self.sig,)
+    return "<Conn %04i %s>" % (self.cookie, self.sig)
 
 
 
@@ -290,45 +352,57 @@ class ConnectionTable (object):
     if con.action.defer: return
     count = 0
 
+    #assert con.sig.is_reverse is False
+    #assert con.sig_r.is_reverse is True
+    mon_any = con.action.monitor_forward or con.action.monitor_backward
+
     msg = of.ofp_flow_mod()
+    msg.cookie = con.cookie
+    msg.flags = of.OFPFF_SEND_FLOW_REM
     msg.match = con.sig_r.match
     msg.match.in_port = OUTSIDE_PORT
     msg.idle_timeout = 10
     msg.hard_timeout = 60 * 2
-    if con.action.forward:
-      count += 1
-      msg.actions.append(of.ofp_action_output(port = INSIDE_PORT))
+    if con.action.forward or con.action.monitor_backward:
+      if con.action.monitor_backward:
+        count += 1
+        msg.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))
+      else:
+        count += 1
+        msg.actions.append(of.ofp_action_output(port = INSIDE_PORT))
       if buffer_id is not None and buffer_reverse:
         msg.buffer_id = buffer_id
       if (data is not None) and (buffer_reverse) and (buffer_id == -1):
         self.gateway.switch.send(of.ofp_packet_out(
          action = of.ofp_action_output(port = INSIDE_PORT),
          data = data))
-    if con.action.monitor_backward:
-      count += 1
-      msg.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))
     self.gateway.switch.send(msg)
 
     msg = of.ofp_flow_mod()
+    msg.cookie = con.cookie
+    msg.flags = of.OFPFF_SEND_FLOW_REM
     msg.match = con.sig.match
     msg.match.in_port = INSIDE_PORT
-    msg.idle_timeout = 10 #FIXME: make 10 (and above too)
+    msg.idle_timeout = 10
     msg.hard_timeout = 60 * 2
-    if con.action.forward:
-      count += 1
-      msg.actions.append(of.ofp_action_output(port = OUTSIDE_PORT))
+    if con.action.forward or con.action.monitor_forward:
+      if con.action.monitor_forward:
+        count += 1
+        msg.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))
+      else:
+      #if True:
+        count += 1
+        msg.actions.append(of.ofp_action_output(port = OUTSIDE_PORT))
       if buffer_id is not None and not buffer_reverse:
         msg.buffer_id = buffer_id
       if (data is not None) and (not buffer_reverse) and (buffer_id == -1):
         self.gateway.switch.send(of.ofp_packet_out(
          action = of.ofp_action_output(port = OUTSIDE_PORT),
          data = data))
-    if con.action.monitor_forward:
-      count += 1
-      msg.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))
     self.gateway.switch.send(msg)
 
     log.debug("Pushed %i rules for %s", count, str(con))
+    con.fully_installed = True
 
 
 class MonitorData (Event):
@@ -337,25 +411,51 @@ class MonitorData (Event):
     self.connection = connection
     self.packet = packet
     self.opaque = connection.opaque
+    self.reverse = self.packet.next.srcip == self.connection.sig.dst
+    self.send = connection.send
 
   def _invoke (self, handler, *args, **kw):
-    reverse = self.packet.next.srcip == self.connection.sig.dst
-    r = handler(self, self.packet, reverse)
+    r = handler(self, self.packet, self.reverse)
     self.connection.opaque = self.opaque
     return r
 
+
+
+def do_send (self, packet, reverse = False):
+  if self.packet is None:
+    self.error("Connection.send() before prototype packet")
+    return
+  if type(packet) is ethernet:
+    eth = packet
+  else:
+    es = self.packet.src
+    ed = self.packet.dst
+    ips = self.packet.next.srcip
+    ipd = self.packet.next.dstip
+    rrr = self.packet.next.srcip == self.sig.dst
+    if reverse is not rrr:
+      es,ed = ed,es
+      ips,ipd = ipd,ips
+
+    eth = ethernet(src=es, dst=ed, type=self.packet.type,
+                   payload=ipv4(srcip=ips, dstip=ipd,
+                   protocol=ipv4.TCP_PROTOCOL, payload=packet))
+
+  core.gateway.switch.send(of.ofp_packet_out(
+       action = of.ofp_action_output(port = INSIDE_PORT if reverse else OUTSIDE_PORT),
+       data = eth.pack()))
 
 class ConnectionIn (Event):
   def __init__ (self, packet, sig):
     Event.__init__(self)
     self.packet = packet
-    #self.port = port
-    #self.dest_port =
 
     self.sig = sig
     self.action = Action()
 
     self.opaque = None
+    self.reverse = self.packet.next.srcip == self.sig.dst
+    self.send = lambda d, r=False : do_send(self, d, r)
 
   def _invoke (self, handler, *args, **kw):
     r = handler(self, self.sig, self.packet)
@@ -370,12 +470,15 @@ class DeferredConnectionIn (ConnectionIn):
     self.sig = connection.sig
     self.action = connection.action
     self.opaque = connection.opaque
+    self.reverse = self.packet.next.srcip == self.connection.sig.dst
+    self.send = connection.send
 
   def _invoke (self, handler, *args, **kw):
     r = handler(self, self.sig, self.packet)
     self.connection.opaque = self.opaque
     return r
 
+stray_timer = Timer(90, roll_strays, recurring=True)
 
 class EE122Gateway (EventMixin):
   _eventMixin_events = set([
@@ -443,15 +546,59 @@ class EE122Gateway (EventMixin):
 
     self.table = ConnectionTable(self)
 
+  def _handle_FlowRemoved (self, event):
+    if event.timeout:
+      if event.ofp.cookie >= COOKIE_MIN:
+        if event.ofp.match.dl_type == ethernet.IP_TYPE:
+          if event.ofp.match.nw_proto == ipv4.TCP_PROTOCOL:
+            a = (event.ofp.match.nw_src, event.ofp.match.tp_src)
+            b = (event.ofp.match.nw_dst, event.ofp.match.tp_dst)
+            sig = FlowSignature(a[0],a[1],b[0],b[1])
+            c = self.table.get(sig)
+            if c is not None:
+              ##log.debug(str(c) + " had an expiration")
+              c.fully_installed = False
 
   def _handle_PacketIn (self, event):
-    def do_monitor (connection, eth, reverse, loud=False):
+    seq_ok = False
+
+    def do_monitor (connection, eth, reverse, loud=False, recurse=True):
       if loud:
         print connection.action, reverse, flow
       if ( (connection.action.monitor_forward and not reverse) or
            (connection.action.monitor_backward and reverse) ):
+        if not seq_ok:
+          log.warning(str(connection) + " not monitoring")
+          return True
         ev = MonitorData(eth, connection)
-        self.raiseEvent(ev)
+        try:
+          if True:#len(eth.next.next.next) > 0:
+            #self.raiseEvent(ev)
+            ev._invoke(fw._handle_MonitorData)
+        except:
+          fw_log.exception("Error in MonitorData handler")
+        while recurse:
+          seq = connection.seq[reverse]
+          if connection.stray[reverse] and seq in connection.stray[reverse]:
+            n = connection.stray[reverse][seq]
+            assert n[1] is reverse
+            del connection.stray[reverse][seq] 
+            global current_buffered_packets
+            current_buffered_packets -= 1
+            #log.info(str(connection) + " play next seq " + str(seq) + " **********************")
+            connection.seq[reverse] = n[2]
+            #log.info(str(connection) + (" next seq is %i %s %s %i" % (seq,reverse,n[1],n[2])))
+            do_monitor(connection, n[0], n[1], recurse=False)
+            if len(connection.stray[reverse]) == 0:
+              log.debug(str(connection) + (" r" if reverse else " f") + " connection caught up")
+              connection.stray[reverse] = None
+              if connection.stray[True] is None and connection.stray[False] is None:
+                connections_with_strays.discard(connection)
+            #log.info(str(current_buffered_packets) + " buffered packetz")
+            if current_buffered_packets == 0:
+              log.debug("all caught up")
+          else:
+            break
         return True
       return False
 
@@ -477,6 +624,48 @@ class EE122Gateway (EventMixin):
     reverse = orig_flow.is_reverse
 
     if connection:
+      #"""
+      if reverse and connection.action.monitor_backward:
+        connection.send(tcpp, reverse)
+      elif (not reverse) and connection.action.monitor_forward:
+        connection.send(tcpp, reverse)
+      #"""
+      #connection.send(tcpp, reverse)
+
+      #print "r" if reverse else "f",connection,connection.seq[reverse],tcpp.seq,len(tcpp.payload),"(",tcpp.seq+len(tcpp.payload),")",tcpp.FIN,tcpp.SYN
+      if reverse and (connection.seq[reverse] is None or connection.action.monitor_backward is False):
+        connection.seq[reverse] = tcpp.seq + len(tcpp.payload)
+        connection.seq[reverse] += 1 if (tcpp.FIN or tcpp.SYN) else 0
+        seq_ok = True
+      elif (reverse is False) and (connection.action.monitor_forward is False):
+        connection.seq[reverse] = tcpp.seq + len(tcpp.payload)
+        connection.seq[reverse] += 1 if (tcpp.FIN or tcpp.SYN) else 0
+        seq_ok = True
+      else:#elif connection.action._monitor_forward or connection.action._monitor_backward:
+        if connection.seq[reverse] == tcpp.seq:
+          seq_ok = True
+          connection.seq[reverse] += len(tcpp.payload)
+          if tcpp.SYN or tcpp.FIN: connection.seq[reverse] += 1
+        elif connection.seq[reverse] > tcpp.seq:
+          ##log.info(str(connection) + " duplicate packet seq %i", tcpp.seq)
+          pass
+        else:
+          #log.warning(str(connection) + " out of sequence ==================")
+          if connection.stray[reverse] is None:
+            connection.stray[reverse] = {}
+            ##log.debug(str(connection) + " %s %i %i out of sequence", "r" if reverse else "f", tcpp.seq, len(tcpp.next))
+          connection.stray_time[reverse] = time.time()
+          connections_with_strays.add(connection)
+          pre = len(connection.stray[reverse])
+          connection.stray[reverse][tcpp.seq] = (eth, reverse, tcpp.seq + len(tcpp.next) + (1 if (tcpp.FIN or tcpp.SYN) else 0))
+          global current_buffered_packets
+          if current_buffered_packets > MAX_BUFFERED_PACKETS or len(connection.stray[reverse]) > MAX_BUFFERED_PER_CONNECTION:
+            log.error("out of packet buffer space!")
+            del connection.stray[reverse][max(connection.stray[reverse].keys())]
+          if pre < len(connection.stray[reverse]):
+            current_buffered_packets += 1
+          log.debug(str(connection) + " " + str(len(connection.stray[reverse])) + " packets (" + str(current_buffered_packets) + " total)")
+
       if connection.action.defer:
         if len(tcpp.payload) == 0 or tcpp.SYN:
           msg = of.ofp_packet_out()
@@ -489,7 +678,10 @@ class EE122Gateway (EventMixin):
         else: #xxx
           connection.action.drop = True
           ev = DeferredConnectionIn(eth, connection)
-          self.raiseEvent(ev)
+          try:
+            self.raiseEvent(ev)
+          except:
+            fw_log.exception("Error in DeferredConnectonIn handler")
           if connection.action.defer:
             log.error("Can't defer a deferred connection!")
             connection.action.drop = True
@@ -514,8 +706,11 @@ class EE122Gateway (EventMixin):
           do_monitor(connection, eth, reverse)
           return
 
-      if do_monitor(connection, eth, reverse, False):
-        return kill_buffer()
+      if do_monitor(connection, eth, reverse):
+        if connection.fully_installed:
+          return kill_buffer()
+        else:
+          log.debug("Need to reinstall flow for %s", flow)
     #elif event.ofp.reason == of.OFPR_ACTION:
     #  log.warning("Packet via OFPR_ACTION but don't have flow for %s", flow)
     #  return kill_buffer()
@@ -530,7 +725,7 @@ class EE122Gateway (EventMixin):
               s = "FIN"
           else:
             s = "RST"
-          log.info("%s for missing connection %s", s, orig_flow)
+          ##log.info("%s for missing connection %s", s, orig_flow)
           #TODO: strip payload?
           msg = of.ofp_packet_out()
           msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
@@ -541,6 +736,7 @@ class EE122Gateway (EventMixin):
           return
         else:
           log.warning("Drop mid-connection packet for %s", orig_flow)
+          log.info("(You may want to restart your browser)")
           return kill_buffer()
       else:
         # Use existing
@@ -549,7 +745,10 @@ class EE122Gateway (EventMixin):
 
     # We don't know this connection
     ev = ConnectionIn(eth, flow)
-    self.raiseEvent(ev)
+    try:
+      self.raiseEvent(ev)
+    except:
+      fw_log.exception("Error in ConnectonIn handler")
     if ev.action.deny:
       deny = tcp(srcport=tcpp.dstport, dstport=tcpp.srcport)
       deny.RST = True
@@ -566,8 +765,10 @@ class EE122Gateway (EventMixin):
 
     connection = self.table.add_connection(flow, ev.action, ev.opaque, reverse,
                                            event.ofp.buffer_id, event.data)
+    connection.seq[False] = tcpp.seq + len(tcpp.payload) + 1
+    connection.packet = eth
+    seq_ok = True
     do_monitor(connection, eth, reverse)
-
 
 
 def launch ():
@@ -575,6 +776,7 @@ def launch ():
     #log.debug("Connection %s" % (event.connection,))
     gw = EE122Gateway(event.connection, event.ofp.ports)
     core.register("gateway", gw)
+
     #gw.addListeners(Controller())
   core.openflow.addListenerByName("ConnectionUp", _handle_ConnectionUp)
 
@@ -582,8 +784,9 @@ def launch ():
     if event.name == "gateway":
       try:
         from firewall import Firewall
-        event.component.addListeners(Firewall())
+        global fw
+        fw = Firewall()
+        event.component.addListeners(fw)
       except:
         fw_log.exception("Couldn't load firewall.py")
   core.addListenerByName("ComponentRegistered", _handle_reg)
-
