@@ -584,6 +584,8 @@ class ofp_match (object):
     (self._dl_vlan, self._dl_vlan_pcp) = struct.unpack_from("!HB", binaryString, 18)
     (self._dl_type, self._nw_tos, self._nw_proto) = struct.unpack_from("!HBB", binaryString, 22)
     (self._nw_src, self._nw_dst, self._tp_src, self._tp_dst) = struct.unpack_from("!LLHH", binaryString, 28)
+    self._nw_src = IPAddr(self._nw_src)
+    self._nw_dst = IPAddr(self._nw_dst)
 
     self.wildcards = self._normalize_wildcards(wildcards) # Override
     return binaryString[40:]
@@ -1664,9 +1666,9 @@ class ofp_stats_request (ofp_header):
   def __init__ (self):
     ofp_header.__init__(self)
     self.header_type = OFPT_STATS_REQUEST
-    self.type = 0
+    self.type = None
     self.flags = 0
-    self.body = b''
+    self.body = None
 
   def _assert (self):
     return (True, None)
@@ -1863,7 +1865,7 @@ class ofp_flow_stats_request (object):
     self.match = ofp_match()
     self.table_id = 0
     self.pad = 0
-    self.out_port = 0
+    self.out_port = OFPP_NONE
 
   def _assert (self):
     if(not isinstance(self.match, ofp_match)):
@@ -2005,7 +2007,7 @@ class ofp_aggregate_stats_request (object):
     self.match = ofp_match()
     self.table_id = 0
     self.pad = 0
-    self.out_port = 0
+    self.out_port = OFPP_NONE
 
   def _assert (self):
     if(not isinstance(self.match, ofp_match)):
