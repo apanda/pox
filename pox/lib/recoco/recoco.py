@@ -589,7 +589,8 @@ class Timer (Task):
       yield Sleep(timeToWake=self._next, absoluteTime=True)
       if self._cancelled: break
       self._next = time.time() + self._interval
-      self._callback(*self._args,**self._kw)
+      if self._callback(*self._args,**self._kw) is False:
+        break
       if not self._recurring: break
     yield False # Quit
 

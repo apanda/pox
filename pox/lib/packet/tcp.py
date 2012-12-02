@@ -80,7 +80,7 @@ class tcp_opt:
             return struct.pack('!BB',self.type,2)
         elif self.type == tcp_opt.SACK:
             return struct.pack("!" + "II" * len(self.val),
-                               [x for p in self.val for x in p])
+                               *[x for p in self.val for x in p])
         elif self.type == tcp_opt.TSOPT:
             return struct.pack('!BBII',self.type,10,self.val[0],self.val[1])
         else:
