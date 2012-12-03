@@ -1,0 +1,13 @@
+--- ovs-vswitchd	2011-11-28 00:22:32.000000000 -0800
++++ ovs-vswitchd	2011-11-29 11:27:30.000000000 -0800
+@@ -53,6 +53,10 @@
+         else
+           ovs-vsctl --no-wait -- --may-exist add-port br0 eth0
+         fi
++        ovs-vsctl --no-wait -- set Controller br0 max_backoff=1000
++        ovs-vsctl --no-wait -- set Controller br0 inactivity_probe=30000
++        ovs-vsctl --no-wait -- set Controller br0 controller_burst_limit=99999999
++        ovs-vsctl --no-wait -- set Controller br0 controller_rate_limit=99999999
+         sleep 1
+ 	start-stop-daemon --start --quiet --pidfile $PIDFILE --exec $DAEMON --test > /dev/null \
+ 		|| return 1
